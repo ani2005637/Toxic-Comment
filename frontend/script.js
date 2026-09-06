@@ -10,6 +10,7 @@ const API_BASE_URL = 'http://localhost:5000';
 
 // DOM Elements
 const commentInput = document.getElementById('commentInput');
+const geminiApiKey = document.getElementById('geminiApiKey');
 const analyzeBtn = document.getElementById('analyzeBtn');
 const clearBtn = document.getElementById('clearBtn');
 const exportBtn = document.getElementById('exportBtn');
@@ -107,13 +108,18 @@ async function analyzeComment() {
     analyzeBtn.disabled = true;
     
     try {
+        const payload = { text: text };
+        if (geminiApiKey && geminiApiKey.value.trim() !== '') {
+            payload.gemini_api_key = geminiApiKey.value.trim();
+        }
+        
         // Make API request
         const response = await fetch(`${API_BASE_URL}/api/predict`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify({ text: text })
+            body: JSON.stringify(payload)
         });
         
         // Check if response is ok
@@ -130,6 +136,11 @@ async function analyzeComment() {
         
         // Store results for export
         currentResults = data;
+        
+        if (data.gemini_error) {
+            console.warn('Gemini fallback triggered. Error:', data.gemini_error);
+            showError('Gemini API failed to process request. Falling back to local model. Error: ' + data.gemini_error);
+        }
         
         // Display results
         displayResults(data);
@@ -149,7 +160,7 @@ async function analyzeComment() {
  * @param {Object} data - API response data
  */
 function displayResults(data) {
-    const { predictions, is_toxic, max_toxicity, toxicity_level, demo_mode } = data;
+    const { predictions, is_toxic, max_toxicity, toxicity_level, demo_mode, used_gemini } = data;
     
     // Show results card
     resultsCard.classList.remove('hidden');
@@ -158,7 +169,7 @@ function displayResults(data) {
     resultsCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     
     // Display overall result
-    displayOverallResult(is_toxic, toxicity_level, max_toxicity, demo_mode);
+    displayOverallResult(is_toxic, toxicity_level, max_toxicity, demo_mode, used_gemini, predictions);
     
     // Display category breakdown
     displayCategories(predictions);
@@ -170,10 +181,33 @@ function displayResults(data) {
  * @param {string} level - Toxicity level
  * @param {number} score - Maximum toxicity score
  * @param {boolean} demoMode - Whether in demo mode
+ * @param {boolean} usedGemini - Whether Gemini API was used
+ * @param {Object} predictions - Category predictions
  */
-function displayOverallResult(isToxic, level, score, demoMode) {
+function displayOverallResult(isToxic, level, score, demoMode, usedGemini, predictions) {
     // Determine result class and icon
     let resultClass, icon, title, description;
+    
+    let primaryType = '';
+    if (isToxic && predictions) {
+        let maxScore = -1;
+        let maxCat = '';
+        for (const [cat, val] of Object.entries(predictions)) {
+            if (val > maxScore) {
+                maxScore = val;
+                maxCat = cat;
+            }
+        }
+        const displayNames = {
+            'toxic': 'General Toxicity',
+            'severe_toxic': 'Severe Toxicity',
+            'obscene': 'Obscene Language',
+            'threat': 'Threatening Language',
+            'insult': 'Insulting Language',
+            'identity_hate': 'Identity Hate / Slurs'
+        };
+        primaryType = ` <span style="font-size: 0.9em; opacity: 0.9; display: block; margin-top: 5px;">Dominant Category: <strong>${displayNames[maxCat] || maxCat}</strong></span>`;
+    }
     
     if (level === 'Safe') {
         resultClass = 'safe';
@@ -184,22 +218,24 @@ function displayOverallResult(isToxic, level, score, demoMode) {
         resultClass = 'moderate';
         icon = '⚠️';
         title = 'Potentially Problematic';
-        description = 'This comment may contain mildly inappropriate content.';
+        description = 'This comment may contain mildly inappropriate content.' + primaryType;
     } else if (level === 'Toxic') {
         resultClass = 'toxic';
         icon = '🚫';
         title = 'Toxic Comment Detected';
-        description = 'This comment contains inappropriate or offensive content.';
+        description = 'This comment contains inappropriate or offensive content.' + primaryType;
     } else {
         resultClass = 'highly-toxic';
         icon = '⛔';
         title = 'Highly Toxic Comment';
-        description = 'This comment contains severely offensive or harmful content.';
+        description = 'This comment contains severely offensive or harmful content.' + primaryType;
     }
     
     // Build HTML
-    const demoNotice = demoMode ? 
-        '<p style="margin-top: 1rem; font-size: 0.875rem; opacity: 0.7;">⚡ Demo Mode: Using keyword-based detection. Run train_model.py for full ML model.</p>' : '';
+    let noticeHtml = '';
+    if (demoMode && !usedGemini) {
+        noticeHtml = '<p style="margin-top: 1rem; font-size: 0.875rem; opacity: 0.7;">⚡ Demo Mode: Using keyword-based detection. Run train_model.py for full ML model.</p>';
+    }
     
     overallResult.className = `overall-result ${resultClass}`;
     overallResult.innerHTML = `
@@ -209,7 +245,7 @@ function displayOverallResult(isToxic, level, score, demoMode) {
         <div style="margin-top: 1rem; font-size: 1.25rem; font-weight: 600;">
             Toxicity Score: ${(score * 100).toFixed(1)}%
         </div>
-        ${demoNotice}
+        ${noticeHtml}
     `;
 }
 

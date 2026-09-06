@@ -10,6 +10,11 @@ import pickle
 import os
 import re
 from datetime import datetime
+import json
+try:
+    from google import genai
+except ImportError:
+    genai = None
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -48,14 +53,14 @@ def load_models():
                 model = pickle.load(f)
             with open(VECTORIZER_PATH, 'rb') as f:
                 vectorizer = pickle.load(f)
-            print("✓ Models loaded successfully!")
+            print("[OK] Models loaded successfully!")
         else:
-            print("⚠ Model files not found. Using demo mode.")
+            print("[WARN] Model files not found. Using demo mode.")
             print("  Run train_model.py to train the actual model.")
             model = None
             vectorizer = None
     except Exception as e:
-        print(f"✗ Error loading models: {str(e)}")
+        print(f"[ERROR] Error loading models: {str(e)}")
         model = None
         vectorizer = None
 
@@ -142,6 +147,89 @@ def get_demo_prediction(text):
     }
     
     return predictions
+
+
+def predict_with_gemini(text, api_key):
+    """
+    Predict toxicity using Gemini API (new SDK)
+    """
+    if genai is None:
+        raise Exception("google-genai package is not installed")
+        
+    try:
+        client = genai.Client(api_key=api_key)
+        
+        prompt = f"""
+        Analyze the following text for toxicity and classify it into 6 categories: 
+        toxic, severe_toxic, obscene, threat, insult, identity_hate.
+        
+        For each category, provide a probability score between 0.0 and 1.0.
+        Return ONLY a raw JSON object with the category names as keys and the scores as values.
+        Do not use markdown formatting or code blocks.
+        
+        Text to analyze: "{text}"
+        """
+        
+        # Dynamically fetch available models
+        models_to_try = []
+        try:
+            # Look for models that support generateContent
+            for m in client.models.list():
+                if 'generateContent' in m.supported_actions:
+                    models_to_try.append(m.name)
+            
+            # Prioritize flash models for speed if available
+            models_to_try.sort(key=lambda x: ('flash' not in x, x))
+            
+            if not models_to_try:
+                models_to_try = ['gemini-2.0-flash', 'gemini-1.5-flash'] # Fallback
+        except Exception as e:
+            # If listing fails, fallback to standard names
+            print(f"Warning: Failed to list models: {e}")
+            models_to_try = ['gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-pro']
+            
+        response = None
+        last_error = None
+        
+        for model_name in models_to_try:
+            try:
+                # the genai client handles the "models/" prefix automatically sometimes, 
+                # but if m.name already has it, we just pass it
+                clean_name = model_name.replace('models/', '')
+                response = client.models.generate_content(
+                    model=clean_name,
+                    contents=prompt
+                )
+                break
+            except Exception as e:
+                last_error = str(e)
+                continue
+                
+        if response is None:
+            raise Exception(f"All models failed. Last error: {last_error}. Models tried: {models_to_try}")
+            
+        response_text = response.text.strip()
+        
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.startswith("```"):
+            response_text = response_text[3:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+            
+        result = json.loads(response_text.strip())
+        
+        final_result = {}
+        for label in TOXICITY_LABELS:
+            final_result[label] = float(result.get(label, 0.0))
+            
+        return final_result
+    except Exception as e:
+        error_msg = f"Gemini API error: {str(e)}"
+        print(error_msg)
+        with open("gemini_debug.log", "a") as f:
+            f.write(error_msg + "\n")
+        return None
 
 
 def predict_toxicity(text):
@@ -244,6 +332,7 @@ def predict():
             }), 400
         
         text = data['text']
+        gemini_api_key = data.get('gemini_api_key', '').strip()
         
         # Validate text is not empty
         if not text or len(text.strip()) == 0:
@@ -252,8 +341,24 @@ def predict():
                 'error': 'Text cannot be empty.'
             }), 400
         
-        # Get predictions
-        predictions = predict_toxicity(text)
+        used_gemini = False
+        predictions = None
+        
+        # Try Gemini if API key is provided
+        gemini_error = None
+        if gemini_api_key:
+            try:
+                predictions = predict_with_gemini(text, gemini_api_key)
+                if predictions is not None:
+                    used_gemini = True
+                else:
+                    gemini_error = "predict_with_gemini returned None"
+            except Exception as e:
+                gemini_error = str(e)
+                
+        # Fallback to local model if Gemini failed or no API key
+        if predictions is None:
+            predictions = predict_toxicity(text)
         
         # Determine if comment is toxic (slightly higher threshold to reduce false positives)
         is_toxic = any(score > 0.65 for score in predictions.values())
@@ -268,7 +373,9 @@ def predict():
             'max_toxicity': round(max_toxicity, 4),
             'toxicity_level': get_toxicity_level(max_toxicity),
             'timestamp': datetime.now().isoformat(),
-            'demo_mode': model is None
+            'demo_mode': model is None and not used_gemini,
+            'used_gemini': used_gemini,
+            'gemini_error': gemini_error
         }
         
         return jsonify(response), 200
@@ -408,7 +515,7 @@ if __name__ == '__main__':
     
     # Run the Flask app
     print("\n" + "="*50)
-    print("🚀 Toxic Comments Classification API")
+    print(">>> Toxic Comments Classification API")
     print("="*50)
     print(f"Server starting on http://localhost:5000")
     print("="*50 + "\n")
